@@ -43,10 +43,13 @@ jobs:
         run: |
           gh issue create \
             --repo "$GITHUB_REPOSITORY" \
-            --title "TEST GitHub Mobile push" \
+            --title "🧪 TEST — GitHub Mobile push" \
             --body "@ddc-init
 
-          Questa Issue è stata creata automaticamente da GitHub Actions per verificare la notifica push sul telefono.
+          🧪 **TEST NOTIFICA GITHUB MOBILE**
+
+          Questa Issue è stata creata automaticamente da GitHub Actions
+          esclusivamente per verificare la notifica push sul telefono.
 
           Nessuna operazione è stata eseguita su Oracle Cloud." \
             --assignee "ddc-init"
@@ -66,7 +69,7 @@ jobs:
       # ========================================================
       # OCI CLI
       # jq è già presente sui runner ubuntu-latest.
-      # Usiamo la cache pip per velocizzare le esecuzioni successive.
+      # Cache pip per velocizzare le esecuzioni successive.
       # ========================================================
       - name: Cache OCI CLI packages
         uses: actions/cache@v4
@@ -171,7 +174,7 @@ jobs:
 
       # ========================================================
       # SE ESISTE GIÀ ED È RUNNING:
-      # NOTIFICA SOLO SE NON ESISTE GIÀ LA ISSUE
+      # NOTIFICA SOLO SE NON ESISTE GIÀ LA ISSUE DI SUCCESSO
       # ========================================================
       - name: Notify if instance already running
         if: steps.existing.outputs.found == 'true' && steps.existing.outputs.instance_state == 'RUNNING'
@@ -189,7 +192,7 @@ jobs:
               | jq -r '.data[0]."public-ip" // "not available"'
           )"
 
-          TITLE="Oracle A1 12 GB is RUNNING"
+          TITLE="✅ SUCCESSO — Oracle A1 12 GB è RUNNING"
 
           COUNT="$(
             gh issue list \
@@ -207,16 +210,21 @@ jobs:
               --title "$TITLE" \
               --body "@ddc-init
 
-          🎉 **Oracle A1 è RUNNING**
+          ✅ **SUCCESSO — ORACLE A1 È ONLINE**
 
-          L'istanza **$INSTANCE_NAME** risulta attiva.
+          L'istanza **$INSTANCE_NAME** risulta correttamente attiva.
 
+          - Stato: **RUNNING**
           - Shape: $SHAPE
           - OCPU: $OCPUS
           - RAM: $MEMORY_GB GB
           - Public IPv4: $PUBLIC_IP
-          - Instance OCID: $INSTANCE_ID" \
+          - Instance OCID: $INSTANCE_ID
+
+          🎉 Il server Oracle A1 è pronto." \
               --assignee "ddc-init"
+
+            echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] SUCCESS notification created"
 
           else
 
@@ -436,9 +444,9 @@ jobs:
 
 
       # ========================================================
-      # SUCCESSO -> ISSUE + @MENTION + PUSH MOBILE
+      # SUCCESSO REALE -> ISSUE + @MENTION + PUSH MOBILE
       # ========================================================
-      - name: Notify success
+      - name: Notify provisioning SUCCESS
         if: steps.running.outputs.instance_id != ''
 
         env:
@@ -456,21 +464,22 @@ jobs:
 
           gh issue create \
             --repo "$GITHUB_REPOSITORY" \
-            --title "Oracle A1 12 GB is RUNNING" \
+            --title "✅ SUCCESSO — Oracle A1 12 GB è RUNNING" \
             --body "@ddc-init
 
-          🎉 **PROVISIONING COMPLETATO**
+          ✅ **SUCCESSO — PROVISIONING COMPLETATO**
 
           Oracle Cloud ha creato correttamente la nuova istanza A1.
 
           - Instance: **$INSTANCE_NAME**
+          - Stato: **RUNNING**
           - Shape: $SHAPE
           - OCPU: $OCPUS
           - RAM: $MEMORY_GB GB
           - Public IPv4: $PUBLIC_IP
           - Instance OCID: $INSTANCE_ID
 
-          L'istanza è nello stato **RUNNING**." \
+          🎉 **Il server è online e pronto per essere configurato.**" \
             --assignee "ddc-init"
 
-          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Mobile notification issue created"
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] SUCCESS — Mobile notification issue created"
