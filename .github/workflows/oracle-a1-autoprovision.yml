@@ -1,0 +1,306 @@
+name: Oracle A1 Auto Provision
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '2-57/5 * * * *'
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: oracle-a1-autoprovision
+  cancel-in-progress: false
+
+env:
+  OCI_AD: lWBU:EU-MILAN-1-AD-1
+  INSTANCE_NAME: docker-server-a1
+  SHAPE: VM.Standard.A1.Flex
+  OCPUS: "2"
+  MEMORY_GB: "12"
+
+jobs:
+  watch-and-provision:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Install OCI CLI and jq
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq
+          python3 -m pip install --user --quiet oci-cli
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Configure OCI authentication
+        env:
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$HOME/.oci"
+          umask 077
+
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/oci_api_key.pem"
+
+          cat > "$HOME/.oci/config" <<EOF
+          [DEFAULT]
+          user=$OCI_USER_OCID
+          fingerprint=$OCI_FINGERPRINT
+          key_file=$HOME/.oci/oci_api_key.pem
+          tenancy=$OCI_TENANCY_OCID
+          region=$OCI_REGION
+          EOF
+
+          chmod 600 "$HOME/.oci/config"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+
+      - name: Check existing instance
+        id: existing
+        env:
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+        run: |
+          set -euo pipefail
+
+          INSTANCE_ID="$(
+            oci compute instance list \
+              --compartment-id "$OCI_TENANCY_OCID" \
+              --display-name "$INSTANCE_NAME" \
+              --all \
+              | jq -r '[.data[] | select(."lifecycle-state" != "TERMINATED")][0].id // empty'
+          )"
+
+          if [ -n "$INSTANCE_ID" ]; then
+            INSTANCE_STATE="$(
+              oci compute instance get \
+                --instance-id "$INSTANCE_ID" \
+                --query 'data."lifecycle-state"' \
+                --raw-output
+            )"
+
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+            echo "instance_state=$INSTANCE_STATE" >> "$GITHUB_OUTPUT"
+
+            echo "Existing instance found: $INSTANCE_ID"
+            echo "State: $INSTANCE_STATE"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No existing instance found."
+          fi
+
+      - name: Notify if instance already running
+        if: steps.existing.outputs.found == 'true' && steps.existing.outputs.instance_state == 'RUNNING'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INSTANCE_ID: ${{ steps.existing.outputs.instance_id }}
+        run: |
+          set -euo pipefail
+
+          PUBLIC_IP="$(
+            oci compute instance list-vnics \
+              --instance-id "$INSTANCE_ID" \
+              | jq -r '.data[0]."public-ip" // "not available"'
+          )"
+
+          TITLE="Oracle A1 12 GB is RUNNING"
+
+          COUNT="$(
+            gh issue list \
+              --repo "$GITHUB_REPOSITORY" \
+              --state all \
+              --search "\"$TITLE\" in:title" \
+              --json title \
+              --jq 'length'
+          )"
+
+          if [ "$COUNT" = "0" ]; then
+            gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE" \
+              --body "Instance **$INSTANCE_NAME** is RUNNING.
+
+          - Shape: $SHAPE
+          - OCPU: $OCPUS
+          - RAM: $MEMORY_GB GB
+          - Public IPv4: $PUBLIC_IP
+          - Instance OCID: $INSTANCE_ID" \
+              --assignee "$GITHUB_REPOSITORY_OWNER"
+          fi
+
+      - name: Stop because instance already exists
+        if: steps.existing.outputs.found == 'true'
+        run: |
+          echo "Instance already exists. Nothing else to do."
+
+      - name: Build capacity request
+        if: steps.existing.outputs.found == 'false'
+        run: |
+          cat > /tmp/shape-availabilities.json <<EOF
+          [
+            {
+              "instanceShape": "$SHAPE",
+              "instanceShapeConfig": {
+                "memoryInGBs": $MEMORY_GB,
+                "ocpus": $OCPUS
+              }
+            }
+          ]
+          EOF
+
+      - name: Check Oracle A1 capacity
+        id: capacity
+        if: steps.existing.outputs.found == 'false'
+        env:
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+        run: |
+          set -euo pipefail
+
+          oci compute compute-capacity-report create \
+            --availability-domain "$OCI_AD" \
+            --compartment-id "$OCI_TENANCY_OCID" \
+            --shape-availabilities file:///tmp/shape-availabilities.json \
+            --region "$OCI_REGION" \
+            > /tmp/capacity.json
+
+          STATUS="$(
+            jq -r '.data["shape-availabilities"][0]["availability-status"]' \
+              /tmp/capacity.json
+          )"
+
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "Capacity status: $STATUS"
+
+      - name: No capacity available
+        if: steps.capacity.outputs.status == 'OUT_OF_HOST_CAPACITY'
+        run: |
+          echo "No A1 2 OCPU / 12 GB capacity available. Will retry on the next scheduled run."
+
+      - name: Apply OCI stack
+        id: apply
+        if: steps.capacity.outputs.status == 'AVAILABLE'
+        env:
+          OCI_STACK_OCID: ${{ secrets.OCI_STACK_OCID }}
+        run: |
+          set -euo pipefail
+
+          JOB_ID="$(
+            oci resource-manager job create-apply-job \
+              --execution-plan-strategy AUTO_APPROVED \
+              --stack-id "$OCI_STACK_OCID" \
+              --query 'data.id' \
+              --raw-output
+          )"
+
+          echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
+          echo "Started Resource Manager Apply job: $JOB_ID"
+
+          for i in $(seq 1 90); do
+            STATE="$(
+              oci resource-manager job get \
+                --job-id "$JOB_ID" \
+                --query 'data."lifecycle-state"' \
+                --raw-output
+            )"
+
+            echo "Apply state: $STATE"
+
+            case "$STATE" in
+              SUCCEEDED)
+                echo "state=SUCCEEDED" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+              FAILED|CANCELED)
+                sleep 2
+                oci resource-manager job get-job-logs-content \
+                  --job-id "$JOB_ID" > /tmp/apply.log || true
+
+                if grep -Eqi 'out of (host )?capacity|out of capacity' /tmp/apply.log; then
+                  echo "Capacity disappeared before provisioning. Will retry later."
+                  echo "state=CAPACITY_LOST" >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
+
+                echo "Unexpected Apply failure:"
+                tail -n 100 /tmp/apply.log || true
+                exit 1
+                ;;
+            esac
+
+            sleep 10
+          done
+
+          echo "Apply timed out."
+          exit 1
+
+      - name: Wait for instance RUNNING
+        id: running
+        if: steps.apply.outputs.state == 'SUCCEEDED'
+        env:
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+        run: |
+          set -euo pipefail
+
+          for i in $(seq 1 60); do
+            INSTANCE_ID="$(
+              oci compute instance list \
+                --compartment-id "$OCI_TENANCY_OCID" \
+                --display-name "$INSTANCE_NAME" \
+                --all \
+                | jq -r '[.data[] | select(."lifecycle-state" != "TERMINATED")][0].id // empty'
+            )"
+
+            if [ -n "$INSTANCE_ID" ]; then
+              STATE="$(
+                oci compute instance get \
+                  --instance-id "$INSTANCE_ID" \
+                  --query 'data."lifecycle-state"' \
+                  --raw-output
+              )"
+
+              echo "Instance state: $STATE"
+
+              if [ "$STATE" = "RUNNING" ]; then
+                echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+
+            sleep 10
+          done
+
+          echo "Instance did not reach RUNNING state in time."
+          exit 1
+
+      - name: Notify success
+        if: steps.running.outputs.instance_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INSTANCE_ID: ${{ steps.running.outputs.instance_id }}
+        run: |
+          set -euo pipefail
+
+          PUBLIC_IP="$(
+            oci compute instance list-vnics \
+              --instance-id "$INSTANCE_ID" \
+              | jq -r '.data[0]."public-ip" // "not available"'
+          )"
+
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Oracle A1 12 GB is RUNNING" \
+            --body "The automatic provisioning succeeded.
+
+          - Instance: **$INSTANCE_NAME**
+          - Shape: $SHAPE
+          - OCPU: $OCPUS
+          - RAM: $MEMORY_GB GB
+          - Public IPv4: $PUBLIC_IP
+          - Instance OCID: $INSTANCE_ID" \
+            --assignee "$GITHUB_REPOSITORY_OWNER"
