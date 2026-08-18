@@ -30,7 +30,7 @@ env:
 jobs:
 
   # ============================================================
-  # MANUAL TEST — GitHub Mobile push notification only
+  # TEST MANUALE — solo notifica GitHub Mobile
   # ============================================================
   test-mobile-notification:
     if: github.event_name == 'workflow_dispatch' && inputs.notification_test == true
@@ -51,23 +51,47 @@ jobs:
           Nessuna operazione è stata eseguita su Oracle Cloud." \
             --assignee "ddc-init"
 
+
   # ============================================================
-  # NORMAL OCI CAPACITY CHECK / PROVISIONING
+  # CONTROLLO CAPACITÀ OCI / PROVISIONING
   # ============================================================
   watch-and-provision:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.notification_test != true)
+
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
 
-      - name: Install OCI CLI and jq
+      # ========================================================
+      # OCI CLI
+      # jq è già presente sui runner ubuntu-latest.
+      # Usiamo la cache pip per velocizzare le esecuzioni successive.
+      # ========================================================
+      - name: Cache OCI CLI packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-oci-cli-pip-v1
+
+      - name: Install OCI CLI
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq
-          python3 -m pip install --user --quiet oci-cli
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Installing OCI CLI"
+
+          python3 -m pip install \
+            --user \
+            --quiet \
+            --disable-pip-version-check \
+            oci-cli
+
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] OCI CLI installation completed"
+
+
+      # ========================================================
+      # AUTENTICAZIONE OCI
+      # ========================================================
       - name: Configure OCI authentication
         env:
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
@@ -75,6 +99,7 @@ jobs:
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
           OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
           OCI_REGION: ${{ secrets.OCI_REGION }}
+
         run: |
           set -euo pipefail
 
@@ -95,15 +120,22 @@ jobs:
           chmod 600 "$HOME/.oci/config"
           chmod 600 "$HOME/.oci/oci_api_key.pem"
 
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] OCI authentication configured"
+
+
       # ========================================================
-      # Check whether the instance already exists
+      # CONTROLLA SE L'ISTANZA ESISTE GIÀ
       # ========================================================
       - name: Check existing instance
         id: existing
+
         env:
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+
         run: |
           set -euo pipefail
+
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Checking existing instance"
 
           INSTANCE_ID="$(
             oci compute instance list \
@@ -114,6 +146,7 @@ jobs:
           )"
 
           if [ -n "$INSTANCE_ID" ]; then
+
             INSTANCE_STATE="$(
               oci compute instance get \
                 --instance-id "$INSTANCE_ID" \
@@ -127,20 +160,26 @@ jobs:
 
             echo "Existing instance found: $INSTANCE_ID"
             echo "State: $INSTANCE_STATE"
+
           else
+
             echo "found=false" >> "$GITHUB_OUTPUT"
             echo "No existing instance found."
+
           fi
 
+
       # ========================================================
-      # If instance already exists and is RUNNING:
-      # notify only if a previous success issue does not exist
+      # SE ESISTE GIÀ ED È RUNNING:
+      # NOTIFICA SOLO SE NON ESISTE GIÀ LA ISSUE
       # ========================================================
       - name: Notify if instance already running
         if: steps.existing.outputs.found == 'true' && steps.existing.outputs.instance_state == 'RUNNING'
+
         env:
           GH_TOKEN: ${{ github.token }}
           INSTANCE_ID: ${{ steps.existing.outputs.instance_id }}
+
         run: |
           set -euo pipefail
 
@@ -162,6 +201,7 @@ jobs:
           )"
 
           if [ "$COUNT" = "0" ]; then
+
             gh issue create \
               --repo "$GITHUB_REPOSITORY" \
               --title "$TITLE" \
@@ -177,20 +217,20 @@ jobs:
           - Public IPv4: $PUBLIC_IP
           - Instance OCID: $INSTANCE_ID" \
               --assignee "ddc-init"
+
           else
+
             echo "Success notification already exists. No duplicate issue created."
+
           fi
 
-      - name: Stop because instance already exists
-        if: steps.existing.outputs.found == 'true'
-        run: |
-          echo "Instance already exists. Nothing else to do."
 
       # ========================================================
-      # Build Oracle capacity request
+      # CREA LA RICHIESTA CAPACITY REPORT
       # ========================================================
       - name: Build capacity request
         if: steps.existing.outputs.found == 'false'
+
         run: |
           cat > /tmp/shape-availabilities.json <<EOF
           [
@@ -204,17 +244,23 @@ jobs:
           ]
           EOF
 
+
       # ========================================================
-      # Check A1 capacity
+      # CONTROLLA CAPACITÀ A1
       # ========================================================
       - name: Check Oracle A1 capacity
         id: capacity
+
         if: steps.existing.outputs.found == 'false'
+
         env:
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_REGION: ${{ secrets.OCI_REGION }}
+
         run: |
           set -euo pipefail
+
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Starting Oracle capacity check"
 
           oci compute compute-capacity-report create \
             --availability-domain "$OCI_AD" \
@@ -229,24 +275,36 @@ jobs:
           )"
 
           echo "status=$STATUS" >> "$GITHUB_OUTPUT"
-          echo "Capacity status: $STATUS"
 
-      - name: No capacity available
-        if: steps.capacity.outputs.status == 'OUT_OF_HOST_CAPACITY'
-        run: |
-          echo "No A1 2 OCPU / 12 GB capacity available."
-          echo "Will retry automatically on the next scheduled run."
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Capacity status: $STATUS"
+
 
       # ========================================================
-      # Capacity found -> apply Resource Manager stack
+      # NESSUNA CAPACITÀ
+      # ========================================================
+      - name: No capacity available
+        if: steps.capacity.outputs.status == 'OUT_OF_HOST_CAPACITY'
+
+        run: |
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] No A1 2 OCPU / 12 GB capacity available."
+          echo "Will retry automatically on the next scheduled run."
+
+
+      # ========================================================
+      # CAPACITÀ DISPONIBILE -> APPLY STACK
       # ========================================================
       - name: Apply OCI stack
         id: apply
+
         if: steps.capacity.outputs.status == 'AVAILABLE'
+
         env:
           OCI_STACK_OCID: ${{ secrets.OCI_STACK_OCID }}
+
         run: |
           set -euo pipefail
+
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Capacity AVAILABLE. Starting OCI stack apply."
 
           JOB_ID="$(
             oci resource-manager job create-apply-job \
@@ -257,6 +315,7 @@ jobs:
           )"
 
           echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
+
           echo "Started Resource Manager Apply job: $JOB_ID"
 
           for i in $(seq 1 90); do
@@ -268,14 +327,19 @@ jobs:
                 --raw-output
             )"
 
-            echo "Apply state: $STATE"
+            echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Apply state: $STATE"
 
             case "$STATE" in
 
               SUCCEEDED)
+
                 echo "state=SUCCEEDED" >> "$GITHUB_OUTPUT"
+
+                echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Stack apply succeeded"
+
                 exit 0
                 ;;
+
 
               FAILED|CANCELED)
 
@@ -285,34 +349,49 @@ jobs:
                   --job-id "$JOB_ID" > /tmp/apply.log || true
 
                 if grep -Eqi 'out of (host )?capacity|out of capacity' /tmp/apply.log; then
+
                   echo "Capacity disappeared before provisioning."
                   echo "Will retry automatically later."
+
                   echo "state=CAPACITY_LOST" >> "$GITHUB_OUTPUT"
+
                   exit 0
+
                 fi
 
                 echo "Unexpected Apply failure:"
+
                 tail -n 100 /tmp/apply.log || true
+
                 exit 1
                 ;;
+
             esac
 
             sleep 10
+
           done
 
           echo "Apply timed out."
+
           exit 1
 
+
       # ========================================================
-      # Wait until the new VM is actually RUNNING
+      # ASPETTA CHE LA VM SIA DAVVERO RUNNING
       # ========================================================
       - name: Wait for instance RUNNING
         id: running
+
         if: steps.apply.outputs.state == 'SUCCEEDED'
+
         env:
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+
         run: |
           set -euo pipefail
+
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Waiting for instance RUNNING"
 
           for i in $(seq 1 60); do
 
@@ -333,28 +412,39 @@ jobs:
                   --raw-output
               )"
 
-              echo "Instance state: $STATE"
+              echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Instance state: $STATE"
 
               if [ "$STATE" = "RUNNING" ]; then
+
                 echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+
+                echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Instance is RUNNING"
+
                 exit 0
+
               fi
+
             fi
 
             sleep 10
+
           done
 
           echo "Instance did not reach RUNNING state in time."
+
           exit 1
 
+
       # ========================================================
-      # SUCCESS -> GitHub Issue + @mention + mobile push
+      # SUCCESSO -> ISSUE + @MENTION + PUSH MOBILE
       # ========================================================
       - name: Notify success
         if: steps.running.outputs.instance_id != ''
+
         env:
           GH_TOKEN: ${{ github.token }}
           INSTANCE_ID: ${{ steps.running.outputs.instance_id }}
+
         run: |
           set -euo pipefail
 
@@ -382,3 +472,5 @@ jobs:
 
           L'istanza è nello stato **RUNNING**." \
             --assignee "ddc-init"
+
+          echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Mobile notification issue created"
