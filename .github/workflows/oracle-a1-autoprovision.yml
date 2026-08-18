@@ -29,6 +29,9 @@ env:
 
 jobs:
 
+  # ============================================================
+  # MANUAL TEST — GitHub Mobile push notification only
+  # ============================================================
   test-mobile-notification:
     if: github.event_name == 'workflow_dispatch' && inputs.notification_test == true
     runs-on: ubuntu-latest
@@ -41,15 +44,23 @@ jobs:
           gh issue create \
             --repo "$GITHUB_REPOSITORY" \
             --title "TEST GitHub Mobile push" \
-            --body "@ddc-init questa Issue è stata creata automaticamente da GitHub Actions per verificare la notifica push sul telefono." \
+            --body "@ddc-init
+
+          Questa Issue è stata creata automaticamente da GitHub Actions per verificare la notifica push sul telefono.
+
+          Nessuna operazione è stata eseguita su Oracle Cloud." \
             --assignee "ddc-init"
 
+  # ============================================================
+  # NORMAL OCI CAPACITY CHECK / PROVISIONING
+  # ============================================================
   watch-and-provision:
-    if: github.event_name == 'schedule' || inputs.notification_test != true
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.notification_test != true)
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
+
       - name: Install OCI CLI and jq
         run: |
           sudo apt-get update -qq
@@ -84,6 +95,9 @@ jobs:
           chmod 600 "$HOME/.oci/config"
           chmod 600 "$HOME/.oci/oci_api_key.pem"
 
+      # ========================================================
+      # Check whether the instance already exists
+      # ========================================================
       - name: Check existing instance
         id: existing
         env:
@@ -118,6 +132,10 @@ jobs:
             echo "No existing instance found."
           fi
 
+      # ========================================================
+      # If instance already exists and is RUNNING:
+      # notify only if a previous success issue does not exist
+      # ========================================================
       - name: Notify if instance already running
         if: steps.existing.outputs.found == 'true' && steps.existing.outputs.instance_state == 'RUNNING'
         env:
@@ -149,7 +167,9 @@ jobs:
               --title "$TITLE" \
               --body "@ddc-init
 
-          Instance **$INSTANCE_NAME** is RUNNING.
+          🎉 **Oracle A1 è RUNNING**
+
+          L'istanza **$INSTANCE_NAME** risulta attiva.
 
           - Shape: $SHAPE
           - OCPU: $OCPUS
@@ -157,6 +177,8 @@ jobs:
           - Public IPv4: $PUBLIC_IP
           - Instance OCID: $INSTANCE_ID" \
               --assignee "ddc-init"
+          else
+            echo "Success notification already exists. No duplicate issue created."
           fi
 
       - name: Stop because instance already exists
@@ -164,6 +186,9 @@ jobs:
         run: |
           echo "Instance already exists. Nothing else to do."
 
+      # ========================================================
+      # Build Oracle capacity request
+      # ========================================================
       - name: Build capacity request
         if: steps.existing.outputs.found == 'false'
         run: |
@@ -179,6 +204,9 @@ jobs:
           ]
           EOF
 
+      # ========================================================
+      # Check A1 capacity
+      # ========================================================
       - name: Check Oracle A1 capacity
         id: capacity
         if: steps.existing.outputs.found == 'false'
@@ -206,8 +234,12 @@ jobs:
       - name: No capacity available
         if: steps.capacity.outputs.status == 'OUT_OF_HOST_CAPACITY'
         run: |
-          echo "No A1 2 OCPU / 12 GB capacity available. Will retry on the next scheduled run."
+          echo "No A1 2 OCPU / 12 GB capacity available."
+          echo "Will retry automatically on the next scheduled run."
 
+      # ========================================================
+      # Capacity found -> apply Resource Manager stack
+      # ========================================================
       - name: Apply OCI stack
         id: apply
         if: steps.capacity.outputs.status == 'AVAILABLE'
@@ -228,6 +260,7 @@ jobs:
           echo "Started Resource Manager Apply job: $JOB_ID"
 
           for i in $(seq 1 90); do
+
             STATE="$(
               oci resource-manager job get \
                 --job-id "$JOB_ID" \
@@ -238,18 +271,22 @@ jobs:
             echo "Apply state: $STATE"
 
             case "$STATE" in
+
               SUCCEEDED)
                 echo "state=SUCCEEDED" >> "$GITHUB_OUTPUT"
                 exit 0
                 ;;
+
               FAILED|CANCELED)
+
                 sleep 2
 
                 oci resource-manager job get-job-logs-content \
                   --job-id "$JOB_ID" > /tmp/apply.log || true
 
                 if grep -Eqi 'out of (host )?capacity|out of capacity' /tmp/apply.log; then
-                  echo "Capacity disappeared before provisioning. Will retry later."
+                  echo "Capacity disappeared before provisioning."
+                  echo "Will retry automatically later."
                   echo "state=CAPACITY_LOST" >> "$GITHUB_OUTPUT"
                   exit 0
                 fi
@@ -266,6 +303,9 @@ jobs:
           echo "Apply timed out."
           exit 1
 
+      # ========================================================
+      # Wait until the new VM is actually RUNNING
+      # ========================================================
       - name: Wait for instance RUNNING
         id: running
         if: steps.apply.outputs.state == 'SUCCEEDED'
@@ -275,6 +315,7 @@ jobs:
           set -euo pipefail
 
           for i in $(seq 1 60); do
+
             INSTANCE_ID="$(
               oci compute instance list \
                 --compartment-id "$OCI_TENANCY_OCID" \
@@ -284,6 +325,7 @@ jobs:
             )"
 
             if [ -n "$INSTANCE_ID" ]; then
+
               STATE="$(
                 oci compute instance get \
                   --instance-id "$INSTANCE_ID" \
@@ -305,6 +347,9 @@ jobs:
           echo "Instance did not reach RUNNING state in time."
           exit 1
 
+      # ========================================================
+      # SUCCESS -> GitHub Issue + @mention + mobile push
+      # ========================================================
       - name: Notify success
         if: steps.running.outputs.instance_id != ''
         env:
@@ -324,12 +369,16 @@ jobs:
             --title "Oracle A1 12 GB is RUNNING" \
             --body "@ddc-init
 
-          The automatic provisioning succeeded.
+          🎉 **PROVISIONING COMPLETATO**
+
+          Oracle Cloud ha creato correttamente la nuova istanza A1.
 
           - Instance: **$INSTANCE_NAME**
           - Shape: $SHAPE
           - OCPU: $OCPUS
           - RAM: $MEMORY_GB GB
           - Public IPv4: $PUBLIC_IP
-          - Instance OCID: $INSTANCE_ID" \
+          - Instance OCID: $INSTANCE_ID
+
+          L'istanza è nello stato **RUNNING**." \
             --assignee "ddc-init"
