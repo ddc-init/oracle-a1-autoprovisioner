@@ -2,6 +2,13 @@ name: Oracle A1 Auto Provision
 
 on:
   workflow_dispatch:
+    inputs:
+      notification_test:
+        description: 'Run only GitHub Mobile notification test'
+        required: false
+        type: boolean
+        default: false
+
   schedule:
     - cron: '2-57/5 * * * *'
 
@@ -21,7 +28,24 @@ env:
   MEMORY_GB: "12"
 
 jobs:
+
+  test-mobile-notification:
+    if: github.event_name == 'workflow_dispatch' && inputs.notification_test == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create GitHub Mobile notification test
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "TEST GitHub Mobile push" \
+            --body "@ddc-init questa Issue è stata creata automaticamente da GitHub Actions per verificare la notifica push sul telefono." \
+            --assignee "ddc-init"
+
   watch-and-provision:
+    if: github.event_name == 'schedule' || inputs.notification_test != true
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -123,14 +147,16 @@ jobs:
             gh issue create \
               --repo "$GITHUB_REPOSITORY" \
               --title "$TITLE" \
-              --body "Instance **$INSTANCE_NAME** is RUNNING.
+              --body "@ddc-init
+
+          Instance **$INSTANCE_NAME** is RUNNING.
 
           - Shape: $SHAPE
           - OCPU: $OCPUS
           - RAM: $MEMORY_GB GB
           - Public IPv4: $PUBLIC_IP
           - Instance OCID: $INSTANCE_ID" \
-              --assignee "$GITHUB_REPOSITORY_OWNER"
+              --assignee "ddc-init"
           fi
 
       - name: Stop because instance already exists
@@ -218,6 +244,7 @@ jobs:
                 ;;
               FAILED|CANCELED)
                 sleep 2
+
                 oci resource-manager job get-job-logs-content \
                   --job-id "$JOB_ID" > /tmp/apply.log || true
 
@@ -295,7 +322,9 @@ jobs:
           gh issue create \
             --repo "$GITHUB_REPOSITORY" \
             --title "Oracle A1 12 GB is RUNNING" \
-            --body "The automatic provisioning succeeded.
+            --body "@ddc-init
+
+          The automatic provisioning succeeded.
 
           - Instance: **$INSTANCE_NAME**
           - Shape: $SHAPE
@@ -303,4 +332,4 @@ jobs:
           - RAM: $MEMORY_GB GB
           - Public IPv4: $PUBLIC_IP
           - Instance OCID: $INSTANCE_ID" \
-            --assignee "$GITHUB_REPOSITORY_OWNER"
+            --assignee "ddc-init"
